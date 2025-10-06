@@ -13,6 +13,8 @@ from urllib.parse import urljoin, urlparse
 import sys
 import os
 from dotenv import load_dotenv
+import psycopg2
+import psycopg2.extras
 
 class DEUScraper:
     def __init__(self):
@@ -30,6 +32,49 @@ class DEUScraper:
             print("⚠️  UYARI: PUSHBULLET_API_KEY .env dosyasında bulunamadı!")
             print("   Pushbullet bildirimleri gönderilmeyecek.")
             print("   .env dosyası oluşturun ve PUSHBULLET_API_KEY=your_key_here ekleyin")
+
+        # PostgreSQL bağlantısı
+        self.database_url = os.getenv('DATABASE_URL')
+        self.db_conn = None
+        if not self.database_url:
+            print("⚠️  UYARI: DATABASE_URL bulunamadı. Veriler dosyaya kaydedilmeyecek.")
+        else:
+            self._init_db()
+
+    def _init_db(self):
+        """
+        PostgreSQL'e bağlanır ve gerekli tabloyu oluşturur.
+        """
+        try:
+            # Heroku için sslmode=require genelde gerekli
+            if 'sslmode=' not in self.database_url:
+                conn_str = self.database_url + ("?sslmode=require" if '?' not in self.database_url else "&sslmode=require")
+            else:
+                conn_str = self.database_url
+            self.db_conn = psycopg2.connect(conn_str)
+            self.db_conn.autocommit = True
+            self._ensure_schema()
+            print("🗄️  PostgreSQL bağlantısı kuruldu ve şema doğrulandı.")
+        except Exception as e:
+            self.db_conn = None
+            print(f"❌ PostgreSQL bağlantısı kurulamadı: {e}")
+
+    def _ensure_schema(self):
+        """
+        bookmarks tablosu yoksa oluşturur.
+        """
+        with self.db_conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bookmarks (
+                    url TEXT PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                );
+                """
+            )
         
     def get_page_content(self, url):
         """
@@ -118,13 +163,28 @@ class DEUScraper:
     
     def load_existing_bookmarks(self, filename='deu_bookmark_links.json'):
         """
-        Mevcut JSON dosyasından bookmarkları yükler
+        Mevcut bookmarkları veri tabanından yükler.
+        DATABASE_URL yoksa eski JSON dosyasından okur (geriye dönük).
         """
+        if self.db_conn:
+            try:
+                with self.db_conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                    cur.execute("SELECT url, text, title, base_url FROM bookmarks")
+                    rows = cur.fetchall()
+                    return [{
+                        'url': row['url'],
+                        'text': row['text'],
+                        'title': row['title'] or '',
+                        'base_url': row['base_url']
+                    } for row in rows]
+            except Exception as e:
+                print(f"❌ Veri tabanından veriler alınamadı: {e}")
+                return []
+        # Geriye dönük: Dosyadan oku
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except FileNotFoundError:
-            print(f"{filename} dosyası bulunamadı. Yeni dosya oluşturulacak.")
             return []
         except Exception as e:
             print(f"Mevcut dosya okunurken hata oluştu: {e}")
@@ -203,33 +263,47 @@ class DEUScraper:
     
     def save_results(self, results, filename='deu_bookmark_links.json'):
         """
-        Sonuçları JSON dosyasına kaydeder
+        Artık JSON'a değil, DB'ye yazıyoruz. Bu metod geriye dönük uyumluluk için tutuldu.
         """
-        try:
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
-            print(f"\nSonuçlar {filename} dosyasına kaydedildi.")
-        except Exception as e:
-            print(f"Sonuçlar kaydedilirken hata oluştu: {e}")
+        if not self.db_conn:
+            # DATABASE_URL yoksa dosyaya yazmaya devam et
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, ensure_ascii=False, indent=2)
+                print(f"\nSonuçlar {filename} dosyasına kaydedildi.")
+            except Exception as e:
+                print(f"Sonuçlar kaydedilirken hata oluştu: {e}")
+            return
+        # DB'ye toplu insert (mevcutları atla)
+        self.append_new_bookmarks(results)
     
     def append_new_bookmarks(self, new_bookmarks, filename='deu_bookmark_links.json'):
         """
-        Yeni bookmarkları mevcut dosyaya ekler
+        Yeni bookmarkları veri tabanına ekler (url üzerinde unique). DATABASE_URL yoksa dosyaya yazar.
         """
+        if self.db_conn:
+            try:
+                with self.db_conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO bookmarks (url, text, title, base_url)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (url) DO NOTHING
+                        """,
+                        [(b['url'], b['text'], b.get('title', ''), b['base_url']) for b in new_bookmarks]
+                    )
+                print(f"\n{len(new_bookmarks)} yeni bookmark veri tabanına eklendi (mevcut olanlar atlandı).")
+            except Exception as e:
+                print(f"Yeni bookmarklar DB'ye eklenirken hata oluştu: {e}")
+            return
+        # Geriye dönük: Dosyaya yaz
         try:
-            # Mevcut bookmarkları yükle
             existing_bookmarks = self.load_existing_bookmarks(filename)
-            
-            # Yeni bookmarkları ekle
             all_bookmarks = existing_bookmarks + new_bookmarks
-            
-            # Dosyaya kaydet
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(all_bookmarks, f, ensure_ascii=False, indent=2)
-            
             print(f"\n{len(new_bookmarks)} yeni bookmark {filename} dosyasına eklendi.")
             print(f"Toplam bookmark sayısı: {len(all_bookmarks)}")
-            
         except Exception as e:
             print(f"Yeni bookmarklar eklenirken hata oluştu: {e}")
     
